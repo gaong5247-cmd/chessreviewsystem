@@ -1,0 +1,41 @@
+name: Publish completed draft builds
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/release.yml'
+      - '.github/workflows/publish-drafts.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish-completed:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Recover fully built releases left as drafts
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner, repo = context.repo.repo;
+            const { data: releases } = await github.rest.repos.listReleases({owner, repo, per_page: 100});
+            const candidates = releases.filter(r => r.draft && /^crs-build-[0-9]+$/.test(r.tag_name));
+            const required = ['.exe', '.msi', '.dmg', '.deb'];
+            let published = 0;
+            for (const release of candidates) {
+              const names = (release.assets || []).map(a => a.name);
+              const complete = required.every(suffix => names.some(name => name.endsWith(suffix)));
+              if (!complete) {
+                core.info('Incomplete release, leaving as draft: ' + release.tag_name);
+                continue;
+              }
+              await github.rest.repos.updateRelease({
+                owner, repo, release_id: release.id, draft: false, prerelease: true
+              });
+              core.info('Published recovered release ' + release.tag_name);
+              published++;
+            }
+            core.summary.addHeading('Draft release recovery')
+              .addRaw('Published ' + published + ' completed release(s).').write();

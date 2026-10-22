@@ -3,6 +3,8 @@ name: Build and Release
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - '.github/workflows/**'
   workflow_dispatch:
 
 permissions:
@@ -136,8 +138,22 @@ jobs:
         with:
           script: |
             const tag = 'crs-build-' + context.runNumber;
-            const release = await github.rest.repos.getReleaseByTag({owner: context.repo.owner, repo: context.repo.repo, tag});
-            await github.rest.repos.updateRelease({
-              owner: context.repo.owner, repo: context.repo.repo,
-              release_id: release.data.id, draft: false, prerelease: true
-            });
+            // The GitHub getReleaseByTag endpoint returns 404 for draft releases.
+            // listReleases DOES return authenticated draft releases.
+            const owner = context.repo.owner, repo = context.repo.repo;
+            const { data: releases } = await github.rest.repos.listReleases({owner, repo, per_page: 100});
+            const release = releases.find(item => item.tag_name === tag);
+            if (!release) core.setFailed('Draft release not found for ' + tag);
+            else {
+              const assetNames = (release.assets || []).map(item => item.name);
+              const required = ['.exe','.msi','.dmg','.deb'];
+              const missing = required.filter(ext => !assetNames.some(name => name.endsWith(ext)));
+              if (missing.length) {
+                core.setFailed('Missing installers for ' + tag + ': ' + missing.join(', '));
+              } else {
+                await github.rest.repos.updateRelease({
+                  owner, repo, release_id: release.id, draft: false, prerelease: true
+                });
+                core.info('Published ' + tag + ' with ' + assetNames.length + ' assets.');
+              }
+            }
