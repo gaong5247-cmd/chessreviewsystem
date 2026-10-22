@@ -1,0 +1,143 @@
+name: Build and Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: ${{ matrix.os }} build
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            args: ""
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            args: ""
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            args: "--target aarch64-apple-darwin"
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@v4
+
+      - name: Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust builds
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+
+      - name: Install Linux system libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev xdg-utils
+
+      - name: Prepare MSYS2 for Stockfish build
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: make git
+          pacboy: toolchain:p
+
+      - name: Fetch pinned Stockfish 19 source
+        shell: bash
+        run: |
+          git clone --branch sf_19 --depth 1 https://github.com/official-stockfish/Stockfish.git stockfish-src
+          mkdir -p src-tauri/binaries src-tauri/resources
+          cp stockfish-src/Copying.txt src-tauri/resources/COPYING
+
+      - name: Compile and embed Stockfish 19 on Linux/macOS
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          make -C stockfish-src/src -j2 net
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            make -C stockfish-src/src -j2 build ARCH=apple-silicon COMP=clang
+          else
+            make -C stockfish-src/src -j2 build ARCH=x86-64-universal
+          fi
+          cp stockfish-src/src/stockfish "src-tauri/binaries/stockfish-${{ matrix.target }}"
+          chmod +x "src-tauri/binaries/stockfish-${{ matrix.target }}"
+          echo -e "uci\nisready\nquit" | "src-tauri/binaries/stockfish-${{ matrix.target }}" | grep "uciok"
+
+      - name: Compile and embed Stockfish 19 on Windows
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: |
+          set -e
+          make -C stockfish-src/src -j2 net
+          make -C stockfish-src/src -j2 build ARCH=x86-64-universal COMP=mingw
+          cp stockfish-src/src/stockfish.exe src-tauri/binaries/stockfish-x86_64-pc-windows-msvc.exe
+
+      - name: Install JS packages and generate bundle icons
+        shell: bash
+        run: |
+          npm install --no-audit --no-fund
+          npm run icons
+
+      - name: Verify frontend build
+        shell: bash
+        run: npm run build
+
+      - name: Run Rust unit tests
+        shell: bash
+        run: cargo test --manifest-path src-tauri/Cargo.toml --no-default-features
+
+      - name: Package installers and upload draft release
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: crs-build-${{ github.run_number }}
+          releaseName: "Chess Review System • Build #${{ github.run_number }}"
+          releaseBody: |
+            Automated desktop build of Chess Review System v0.1.0, with Stockfish 19 bundled.
+            Download the appropriate Windows, Linux or macOS installer below.
+            Move grades and accuracy are independent estimates, not official Chess.com results.
+            Source code: https://github.com/gaong5247-cmd/chessreviewsystem
+            Stockfish GPLv3 source: https://github.com/official-stockfish/Stockfish/tree/sf_19
+          releaseDraft: true
+          prerelease: true
+          args: ${{ matrix.args }}
+
+  publish:
+    needs: [build]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Make release public only when all platforms succeeded
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const tag = 'crs-build-' + context.runNumber;
+            const release = await github.rest.repos.getReleaseByTag({owner: context.repo.owner, repo: context.repo.repo, tag});
+            await github.rest.repos.updateRelease({
+              owner: context.repo.owner, repo: context.repo.repo,
+              release_id: release.data.id, draft: false, prerelease: true
+            });
